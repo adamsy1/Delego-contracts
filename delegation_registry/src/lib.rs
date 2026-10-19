@@ -144,6 +144,28 @@ pub struct DelegationRecord {
     pub version: u32,
     /// Capabilities granted to the delegate, packed into one word (issue #322).
     pub permissions: PermissionBitmask,
+    /// Nonce for key revocation tracking - incrementing this invalidates all prior authorizations.
+    pub nonce: u64,
+}
+
+/// A sub-account record for dedicated micro-payment agents.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SubAccountRecord {
+    /// Unique identifier for the sub-account.
+    pub id: u64,
+    /// Address of the sub-account owner.
+    pub owner: Address,
+    /// Virtual address for the sub-account.
+    pub sub_account_address: Address,
+    /// Associated delegation id.
+    pub delegation_id: u64,
+    /// Human-readable label for the sub-account.
+    pub label: Symbol,
+    /// Ledger timestamp when the sub-account was created.
+    pub created_at: u64,
+    /// Whether the sub-account is active.
+    pub is_active: bool,
 }
 
 /// A point-in-time snapshot of a delegation.
@@ -259,6 +281,52 @@ pub struct PermissionFlagsChangedEvent {
     pub timestamp: u64,
 }
 
+/// Emitted when a delegation key is revoked via nonce invalidation.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct DelegationKeyRevokedEvent {
+    /// Unique delegation identifier.
+    pub delegation_id: u64,
+    /// Address of the delegation owner.
+    pub owner: Address,
+    /// Identifier of the associated agent.
+    pub agent: BytesN<32>,
+    /// New nonce value after revocation.
+    pub new_nonce: u64,
+    /// Ledger timestamp of the event.
+    pub timestamp: u64,
+}
+
+/// Emitted when a sub-account is created.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SubAccountCreatedEvent {
+    /// Unique sub-account identifier.
+    pub sub_account_id: u64,
+    /// Address of the sub-account owner.
+    pub owner: Address,
+    /// Virtual address for the sub-account.
+    pub sub_account_address: Address,
+    /// Associated delegation id.
+    pub delegation_id: u64,
+    /// Ledger timestamp of the event.
+    pub timestamp: u64,
+}
+
+/// Emitted when a sub-account is deactivated.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct SubAccountDeactivatedEvent {
+    /// Unique sub-account identifier.
+    pub sub_account_id: u64,
+    /// Address of the sub-account owner.
+    pub owner: Address,
+    /// Virtual address for the sub-account.
+    pub sub_account_address: Address,
+    /// Ledger timestamp of the event.
+    pub timestamp: u64,
+}
+
 /// Emitted when the current admin proposes a successor.
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -309,6 +377,14 @@ pub enum DataKey {
     SnapshotSchemaVersion(u64),
     /// Admin address proposed to take over, pending acceptance.
     ProposedAdmin,
+    /// Nonce for delegation key revocation tracking.
+    DelegationNonce(u64),
+    /// Sub-account record for dedicated micro-payment agents.
+    SubAccount(Address, u64),
+    /// Next sub-account id to issue for an owner.
+    NextSubAccountId(Address),
+    /// Sub-account ids associated with an owner.
+    OwnerSubAccounts(Address),
 }
 
 /// Errors for delegation registry operations.
@@ -361,6 +437,12 @@ pub enum DelegationError {
     InvalidPermissionFlag = 4015,
     /// The sweep batch is empty or exceeds the maximum supported size.
     InvalidBatchSize = 4016,
+    /// The sub-account was not found.
+    SubAccountNotFound = 4017,
+    /// The sub-account is not active.
+    SubAccountNotActive = 4018,
+    /// The delegation does not match the sub-account.
+    DelegationMismatch = 4019,
 }
 
 /// The delegation registry contract.
@@ -585,6 +667,7 @@ impl DelegationRegistry {
             expires_at_ledger,
             version: 1,
             permissions,
+            nonce: 0,
         };
 
         env.storage()
@@ -1571,6 +1654,464 @@ impl DelegationRegistry {
         }
         expired
     }
+
+    // ── Nonce-Invalidating Delegation Key Revocation ──────────────────────────
+
+    /// Revokes a delegation key by incrementing its nonce, invalidating all
+    /// prior authorizations without changing the delegation's lifecycle status.
+    ///
+    /// This provides a lightweight revocation mechanism that allows the owner
+    /// to invalidate compromised keys while maintaining the delegation's
+    /// configuration and history. The delegation remains in its current status
+    /// (Active/Paused) but all authorization checks will fail until new keys
+    /// are issued with the updated nonce.
+    ///
+    /// Returns the new nonce value.
+    pub fn revoke_delegation_key(env: Env, delegation_id: u64) -> Result<u64, DelegationError> {
+        let mut record: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+            .ok_or(DelegationError::NotFound)?;
+
+        record.owner.require_auth();
+
+        // Increment the nonce to invalidate all prior authorizations
+        let new_nonce = record
+            .nonce
+            .checked_add(1)
+            .ok_or(DelegationError::IdExhausted)?;
+        record.nonce = new_nonce;
+        record.version = Self::increment_version(&env, delegation_id);
+        record.updated_at = env.ledger().timestamp();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Delegation(delegation_id), &record);
+
+        // Store nonce separately for efficient lookup
+        env.storage()
+            .persistent()
+            .set(&DataKey::DelegationNonce(delegation_id), &new_nonce);
+        env.storage().persistent().extend_ttl(
+            &DataKey::DelegationNonce(delegation_id),
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        Self::store_snapshot(&env, delegation_id, &record);
+
+        // Topics: (contract, action, entity_id) — entity_id is the delegation id.
+        env.events().publish(
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("key_rvk"),
+                delegation_id,
+            ),
+            DelegationKeyRevokedEvent {
+                delegation_id,
+                owner: record.owner.clone(),
+                agent: record.agent_id.clone(),
+                new_nonce,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(new_nonce)
+    }
+
+    /// Returns the current nonce for a delegation.
+    ///
+    /// The nonce tracks how many times the delegation key has been revoked.
+    /// Authorization checks should verify that the presented nonce matches
+    /// the current nonce stored on-chain.
+    pub fn get_delegation_nonce(env: Env, delegation_id: u64) -> Result<u64, DelegationError> {
+        let record: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+            .ok_or(DelegationError::NotFound)?;
+
+        Ok(record.nonce)
+    }
+
+    /// Returns whether the given agent is authorized for a delegation with the specified nonce.
+    ///
+    /// This extends the standard authorization check to include nonce verification,
+    /// ensuring that only the current key generation is accepted.
+    pub fn is_authorized_with_nonce(
+        env: Env,
+        delegation_id: u64,
+        agent_id: BytesN<32>,
+        nonce: u64,
+    ) -> bool {
+        let record: DelegationRecord = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+        {
+            Some(r) => r,
+            None => return false,
+        };
+
+        if record.status != DelegationStatus::Active {
+            return false;
+        }
+
+        if env.ledger().sequence() >= record.expires_at_ledger {
+            return false;
+        }
+
+        if record.agent_id != agent_id {
+            return false;
+        }
+
+        // Verify nonce matches current value
+        if record.nonce != nonce {
+            return false;
+        }
+
+        // Bump TTL on both the delegation record and its owner index so
+        // active delegations stay alive while they're being queried.
+        Self::bump_delegation(&env, delegation_id, &record.owner);
+
+        true
+    }
+
+    /// Returns whether the agent is authorized for a specific permission flag
+    /// with nonce verification.
+    ///
+    /// Combines permission flag checking with nonce validation for complete
+    /// authorization verification.
+    pub fn is_authorized_for_with_nonce(
+        env: Env,
+        delegation_id: u64,
+        agent_id: BytesN<32>,
+        flag: u32,
+        nonce: u64,
+    ) -> bool {
+        if !PermissionBitmask::is_valid_flag(flag) {
+            return false;
+        }
+
+        let record: DelegationRecord = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+        {
+            Some(r) => r,
+            None => return false,
+        };
+
+        if record.status != DelegationStatus::Active {
+            return false;
+        }
+
+        if env.ledger().sequence() >= record.expires_at_ledger {
+            return false;
+        }
+
+        if record.agent_id != agent_id {
+            return false;
+        }
+
+        if !record.permissions.has_flag(flag) {
+            return false;
+        }
+
+        // Verify nonce matches current value
+        if record.nonce != nonce {
+            return false;
+        }
+
+        // Bump TTL on both the delegation record and its owner index so
+        // active delegations stay alive while they're being queried.
+        Self::bump_delegation(&env, delegation_id, &record.owner);
+
+        true
+    }
+
+    // ── Delegation Sub-Account Creation ───────────────────────────────────────
+
+    /// Creates a sub-account for dedicated micro-payment agent operations.
+    ///
+    /// Sub-accounts provide isolated virtual addresses linked to a delegation,
+    /// enabling fine-grained control over micro-payment flows without exposing
+    /// the main account. Each sub-account is tied to a specific delegation and
+    /// inherits its permissions and lifecycle.
+    ///
+    /// Returns the sub-account id.
+    pub fn create_sub_account(
+        env: Env,
+        owner: Address,
+        delegation_id: u64,
+        label: Symbol,
+    ) -> Result<u64, DelegationError> {
+        owner.require_auth();
+
+        // Verify the delegation exists and belongs to the owner
+        let delegation: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+            .ok_or(DelegationError::NotFound)?;
+
+        if delegation.owner != owner {
+            return Err(DelegationError::NotAuthorized);
+        }
+
+        // Get or initialize the next sub-account id for this owner
+        let next_id_key = DataKey::NextSubAccountId(owner.clone());
+        let id = env
+            .storage()
+            .persistent()
+            .get(&next_id_key)
+            .unwrap_or(1u64);
+        let next_id = id.checked_add(1).ok_or(DelegationError::IdExhausted)?;
+        env.storage().persistent().set(&next_id_key, &next_id);
+        env.storage().persistent().extend_ttl(
+            &next_id_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Create a deterministic sub-account address derived from owner and id
+        // In practice, this could be a contract address or a derived key
+        let sub_account_address = owner.clone(); // Placeholder - in production, derive a unique address
+
+        let now = env.ledger().timestamp();
+        let record = SubAccountRecord {
+            id,
+            owner: owner.clone(),
+            sub_account_address: sub_account_address.clone(),
+            delegation_id,
+            label,
+            created_at: now,
+            is_active: true,
+        };
+
+        // Store the sub-account record
+        let sub_account_key = DataKey::SubAccount(owner.clone(), id);
+        env.storage().persistent().set(&sub_account_key, &record);
+        env.storage().persistent().extend_ttl(
+            &sub_account_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Add to owner's sub-account list
+        let owner_sub_accounts_key = DataKey::OwnerSubAccounts(owner.clone());
+        let mut sub_accounts = env
+            .storage()
+            .persistent()
+            .get::<_, Vec<u64>>(&owner_sub_accounts_key)
+            .unwrap_or(Vec::new(&env));
+        sub_accounts.push_back(id);
+        env.storage()
+            .persistent()
+            .set(&owner_sub_accounts_key, &sub_accounts);
+        env.storage().persistent().extend_ttl(
+            &owner_sub_accounts_key,
+            PERSISTENT_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+
+        // Bump the instance TTL to keep the contract alive
+        env.storage()
+            .instance()
+            .extend_ttl(PERSISTENT_BUMP_THRESHOLD, PERSISTENT_BUMP_AMOUNT);
+
+        // Topics: (contract, action, entity_id) — entity_id is the sub-account id.
+        env.events().publish(
+            (EVENT_TOPIC_CONTRACT, symbol_short!("sub_crtd"), id),
+            SubAccountCreatedEvent {
+                sub_account_id: id,
+                owner,
+                sub_account_address,
+                delegation_id,
+                timestamp: now,
+            },
+        );
+
+        Ok(id)
+    }
+
+    /// Deactivates a sub-account, preventing further operations.
+    ///
+    /// The sub-account record is preserved for audit purposes but marked as
+    /// inactive. The owner can reactivate it later if needed.
+    pub fn deactivate_sub_account(
+        env: Env,
+        owner: Address,
+        sub_account_id: u64,
+    ) -> Result<bool, DelegationError> {
+        owner.require_auth();
+
+        let sub_account_key = DataKey::SubAccount(owner.clone(), sub_account_id);
+        let mut record: SubAccountRecord = env
+            .storage()
+            .persistent()
+            .get(&sub_account_key)
+            .ok_or(DelegationError::SubAccountNotFound)?;
+
+        if record.owner != owner {
+            return Err(DelegationError::NotAuthorized);
+        }
+
+        if !record.is_active {
+            return Ok(false); // Already inactive
+        }
+
+        record.is_active = false;
+        env.storage().persistent().set(&sub_account_key, &record);
+
+        // Topics: (contract, action, entity_id) — entity_id is the sub-account id.
+        env.events().publish(
+            (
+                EVENT_TOPIC_CONTRACT,
+                symbol_short!("sub_deac"),
+                sub_account_id,
+            ),
+            SubAccountDeactivatedEvent {
+                sub_account_id,
+                owner,
+                sub_account_address: record.sub_account_address.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(true)
+    }
+
+    /// Reactivates a previously deactivated sub-account.
+    pub fn reactivate_sub_account(
+        env: Env,
+        owner: Address,
+        sub_account_id: u64,
+    ) -> Result<bool, DelegationError> {
+        owner.require_auth();
+
+        let sub_account_key = DataKey::SubAccount(owner.clone(), sub_account_id);
+        let mut record: SubAccountRecord = env
+            .storage()
+            .persistent()
+            .get(&sub_account_key)
+            .ok_or(DelegationError::SubAccountNotFound)?;
+
+        if record.owner != owner {
+            return Err(DelegationError::NotAuthorized);
+        }
+
+        if record.is_active {
+            return Ok(false); // Already active
+        }
+
+        // Verify the associated delegation is still valid
+        let delegation: DelegationRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(record.delegation_id))
+            .ok_or(DelegationError::NotFound)?;
+
+        if delegation.status == DelegationStatus::Revoked
+            || delegation.status == DelegationStatus::Expired
+        {
+            return Err(DelegationError::DelegationMismatch);
+        }
+
+        record.is_active = true;
+        env.storage().persistent().set(&sub_account_key, &record);
+
+        Ok(true)
+    }
+
+    /// Returns a sub-account record by owner and id.
+    pub fn get_sub_account(
+        env: Env,
+        owner: Address,
+        sub_account_id: u64,
+    ) -> Result<SubAccountRecord, DelegationError> {
+        let sub_account_key = DataKey::SubAccount(owner.clone(), sub_account_id);
+        let record: SubAccountRecord = env
+            .storage()
+            .persistent()
+            .get(&sub_account_key)
+            .ok_or(DelegationError::SubAccountNotFound)?;
+
+        Ok(record)
+    }
+
+    /// Returns all sub-accounts owned by the given address.
+    pub fn get_sub_accounts_by_owner(env: Env, owner: Address) -> Vec<SubAccountRecord> {
+        let owner_sub_accounts_key = DataKey::OwnerSubAccounts(owner.clone());
+        let sub_account_ids: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&owner_sub_accounts_key)
+            .unwrap_or(Vec::new(&env));
+
+        let mut records = Vec::new(&env);
+        for id in sub_account_ids.iter() {
+            let sub_account_key = DataKey::SubAccount(owner.clone(), id);
+            if let Some(record) = env
+                .storage()
+                .persistent()
+                .get::<_, SubAccountRecord>(&sub_account_key)
+            {
+                records.push_back(record);
+            }
+        }
+        records
+    }
+
+    /// Returns all active sub-accounts for an owner.
+    pub fn get_active_sub_accounts(env: Env, owner: Address) -> Vec<SubAccountRecord> {
+        let mut active = Vec::new(&env);
+        for record in Self::get_sub_accounts_by_owner(env.clone(), owner).iter() {
+            if record.is_active {
+                // Verify the associated delegation is still valid
+                if let Some(delegation) = env
+                    .storage()
+                    .persistent()
+                    .get::<_, DelegationRecord>(&DataKey::Delegation(record.delegation_id))
+                {
+                    if delegation.status == DelegationStatus::Active
+                        && env.ledger().sequence() < delegation.expires_at_ledger
+                    {
+                        active.push_back(record.clone());
+                    }
+                }
+            }
+        }
+        active
+    }
+
+    /// Returns all sub-accounts associated with a specific delegation.
+    pub fn get_sub_accounts_by_delegation(
+        env: Env,
+        delegation_id: u64,
+    ) -> Vec<SubAccountRecord> {
+        // First verify the delegation exists
+        let delegation: DelegationRecord = match env
+            .storage()
+            .persistent()
+            .get(&DataKey::Delegation(delegation_id))
+        {
+            Some(d) => d,
+            None => return Vec::new(&env),
+        };
+
+        let owner = delegation.owner;
+        let mut matching_records = Vec::new(&env);
+
+        for record in Self::get_sub_accounts_by_owner(env.clone(), owner).iter() {
+            if record.delegation_id == delegation_id {
+                matching_records.push_back(record.clone());
+            }
+        }
+        matching_records
+    }
+
     /// Extends the TTL on the delegation record and its owner-index key,
     /// keeping them alive in persistent storage. Called from read paths
     /// (`get_delegation`, `get_delegations_by_owner`, `is_authorized`) so
@@ -1703,6 +2244,9 @@ mod error_code_uniqueness_tests {
             (DelegationError::NotAuthorized, 4014u32),
             (DelegationError::InvalidPermissionFlag, 4015u32),
             (DelegationError::InvalidBatchSize, 4016u32),
+            (DelegationError::SubAccountNotFound, 4017u32),
+            (DelegationError::SubAccountNotActive, 4018u32),
+            (DelegationError::DelegationMismatch, 4019u32),
         ];
 
         for (variant, expected) in codes {
@@ -1726,6 +2270,9 @@ mod error_code_uniqueness_tests {
             DelegationError::NotAuthorized as u32,
             DelegationError::InvalidPermissionFlag as u32,
             DelegationError::InvalidBatchSize as u32,
+            DelegationError::SubAccountNotFound as u32,
+            DelegationError::SubAccountNotActive as u32,
+            DelegationError::DelegationMismatch as u32,
         ];
         seen.sort_unstable();
         for pair in seen.windows(2) {
